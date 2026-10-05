@@ -1,0 +1,39 @@
+cff-version: 1.2.0
+message: "If you use or reference this software, please cite it as below."
+title: "Huiran-cerebro (赛博大脑) — 个人/团队记忆中枢与知识库引擎"
+abstract: >-
+  A single-file SQLite memory and knowledge engine for AI agents and personal
+  knowledge management. Combines a RAG knowledge base, typed memory fragments,
+  an entity relationship graph, and RRF-based hybrid retrieval (FTS5 BM25 +
+  LIKE + entity + local semantic vectors) in one dependency-free file.
+  Ships a Flask web UI and a Model Context Protocol (MCP) server.
+type: software
+authors:
+  - alias: qilunuojiang9-hue
+    website: "https://github.com/qilunuojiang9-hue"
+license: MIT
+repository-code: "https://github.com/qilunuojiang9-hue/Huiran-cerebro"
+url: "https://github.com/qilunuojiang9-hue/Huiran-cerebro"
+version: 1.6.1
+date-released: "2026-10-05"
+keywords:
+  - agent-memory
+  - long-term-memory
+  - memory-layer
+  - llm-memory
+  - retrieval-augmented-generation
+  - rag
+  - hybrid-retrieval
+  - reciprocal-rank-fusion
+  - semantic-search
+  - full-text-search
+  - fts5
+  - sqlite
+  - model-context-protocol
+  - mcp
+  - personal-knowledge-management
+  - second-brain
+  - local-first
+  - privacy
+  - chinese-nlp
+  - onnx

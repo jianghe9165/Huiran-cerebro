@@ -1,0 +1,133 @@
+# Huiran-cerebro (赛博大脑) — 完整参考
+
+> 本文件是 [llms.txt](llms.txt) 的「完整版」，供 LLM / AI 爬虫获取更详细的项目信息。
+> 人类读者请看 [README.md](README.md)。
+
+---
+
+## 一句话
+
+Huiran-cerebro（赛博大脑）是一个**个人 / 团队记忆中枢与知识库引擎**：
+单文件 SQLite 存储、零服务依赖，把「知识库 RAG + 记忆碎片 + 实体关系 + AI 混合检索」
+四层能力装进一个 `.db` 文件，可作 AI 助手（Agent）的外接记忆层（Memory Layer）。
+
+- 仓库：https://github.com/qilunuojiang9-hue/Huiran-cerebro
+- 许可证：MIT
+- 语言：Python 3.10+
+- 当前版本：1.6.1
+
+## 它解决什么问题
+
+1. **AI 会话记忆断片** —— 上午做的下午就忘，跨会话没有上下文
+2. **个人 / 团队知识分散** —— 笔记、文档、决策散落在各处，检索靠记忆
+3. **中文检索效果差** —— 通用全文检索引擎对中文分词支持不佳
+4. **记忆不衰减** —— 旧内容淹没新内容，越用越吵
+
+## 核心技术
+
+| 能力 | 实现 |
+|---|---|
+| 存储 | SQLite 单文件（`cyber_brain.db`） |
+| 中文全文检索 | SQLite FTS5 + `trigram` 分词（3 字滑窗），<3 字自动回退 `LIKE` |
+| 语义检索 | `bge-small-zh-v1.5` 本地向量（fastembed + ONNX Runtime，512 维，可离线） |
+| 混合检索 | **RRF（Reciprocal Rank Fusion）四路融合**：FTS-BM25 + LIKE + 实体 + 语义向量 |
+| 时间感知 | `recall --days N` 限定时间窗；时间衰减排序（高价值记忆不衰减） |
+| 生命周期 | `importance` 自动分级 + 过期降权 + 重复合并（可预演、可撤销） |
+| 审计 | `memory_retrieval_audits`（检索留痕）+ `memory_mutations`（变更留痕） |
+| Web 界面 | Flask（搜索 / 录入 / 浏览 / 实体关系 / 关系图谱 / AI 问答 / 冲突检测 / 检索记录 / 今日看板） |
+| MCP | fastmcp 4.x，streamable HTTP，默认 `127.0.0.1:8765/mcp` |
+
+## 四层数据模型
+
+| 层 | 表 | 用途 |
+|---|---|---|
+| 内容实体 | `content_item` | 笔记 / 文章 / 任务 / 决策 |
+| RAG 知识库 | `kb_document` → `kb_chunk` | 长文本自动分块 + 向量检索 |
+| 记忆碎片 | `memory_fragments` | 8 类原子记忆（见下） |
+| 实体关系网 | `entity` / `entity_link` | 人 / 组织 / 项目 / 账号 / 平台 / 产品 及其关系 |
+
+记忆碎片的 8 个类型：
+`fact` · `preference` · `emotion` · `knowledge` · `decision` · `iron_rule` · `event` · `pitfall`
+
+## 常用命令
+
+```bash
+pip install -r requirements.txt
+
+# 写入记忆（importance 自动分级）
+python cyber_brain.py --db cyber_brain.db frag --add --type fact --content "今天是周五" --subject work
+
+# 检索
+python cyber_brain.py --db cyber_brain.db recall "关键词"            # 防遗忘上下文（含滚动摘要）
+python cyber_brain.py --db cyber_brain.db recall --days 7 "关键词"   # 只召回最近 7 天
+python cyber_brain.py --db cyber_brain.db search "关键词"            # 统一搜索（五源一次命中）
+
+# 生命周期
+python cyber_brain.py --db cyber_brain.db lifecycle --audit          # 只读审计
+python cyber_brain.py --db cyber_brain.db lifecycle --apply          # 补分级 + 过期降权
+python cyber_brain.py --db cyber_brain.db lifecycle --dedupe         # 重复检测（只预演）
+python cyber_brain.py --db cyber_brain.db lifecycle --dedupe --apply # 真正标记合并
+python cyber_brain.py --db cyber_brain.db lifecycle --unmerge 12     # 撤销合并
+
+# 主动提取 / 会话打卡
+python summarize.py --days 7
+python session_log.py "今天完成了什么"
+
+# 服务
+python web_ui.py        # http://127.0.0.1:8899
+python mcp_server.py    # http://127.0.0.1:8765/mcp
+
+# 演示数据 / 测试
+python tools/_seed_demo.py
+python tools/test_cyber_brain.py
+```
+
+## 设计取舍（为什么这么做）
+
+- **为什么是 SQLite**：个人量级下换取「备份 = 拷文件、换机零迁移、无外部服务」。
+  向量也存库内；规模上去后 `kb_embedding` 可平滑迁到 pgvector。
+- **为什么用 trigram**：FTS5 默认的 `unicode61` 按空格切词，中文无空格 → 几乎不可用。
+- **为什么合并默认不落库**：重复判定是启发式的，误合并代价高于漏合并，先让人看预演结果。
+- **为什么合并用标记而非删除**：保留可追溯性与可撤销性；标记后的碎片不再出现在检索与上下文中。
+- **数据不出本机**：全文检索、向量推理、存储均为本地；仅在显式配置云端模型时才出网。
+
+## 测试与工程实践
+
+- `tools/test_cyber_brain.py`：核心测试套件（19 条断言），取向是**测命令而非只测函数** ——
+  断言落在「执行后数据真的变了」这一层。
+- `tools/check_version.py`：版本号单一事实源校验（`__version__` ↔ README 徽章 ↔ git tag）。
+- `tools/check_sanitize.py`：发布前脱敏检验（P0/P1/P2 三级，含 `--history` 扫全历史）。
+- `tools/_seed_demo.py`：一键生成虚构演示数据。
+
+## 第三方审阅
+
+[Agent Memory Atlas](https://neoneye.github.io/agent-memory-atlas/systems/huiran-cerebro/)
+曾以固定 7 项机制（tombstone / trust state / bi-temporal / scope enforced /
+mutation audit / human review / negative evals）对本项目做逐行代码审查。
+
+对 v1.5.0 的评级为 0/7，指出的问题类型是「机制已声明但未接线」。
+**v1.6.0 已逐条修复**（去重两段式、检索侧补 status 谓词、修 namespace 缺列、
+新增变更审计与撤销合并、补测试套件）。详见 CHANGELOG.md。
+
+> 语境参考：该图谱的统计显示其收录系统中 44% 同样为 0 或 1 项；
+> 其方法论说明未标记表示「在该 commit 上未找到该机制」，不代表系统需要它。
+
+## 项目没有做什么
+
+- 不是通用 Agent 框架，不替代 Mem0 / Letta / Zep 等记忆层 SDK
+- 不做云端同步、不做多租户 SaaS
+- 仓库**只发布源码框架，不含任何实际数据**（`cyber_brain.db` 已在 `.gitignore` 中）
+
+## 关键词
+
+agent memory, long-term memory, memory layer, LLM memory, RAG,
+retrieval-augmented generation, hybrid retrieval, reciprocal rank fusion,
+semantic search, full-text search, FTS5, trigram, SQLite, ONNX, local-first,
+privacy, personal knowledge management, second brain, Chinese NLP,
+Model Context Protocol, MCP
+
+## 参考
+
+- [llms.txt 规范](https://llmstxt.org/)
+- [Agent Memory Atlas](https://neoneye.github.io/agent-memory-atlas/)
+- [MCP 协议](https://modelcontextprotocol.io/)

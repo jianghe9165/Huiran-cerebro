@@ -5,7 +5,7 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/版本-v1.6.0-4B8BF5" alt="version">
+  <img src="https://img.shields.io/badge/版本-v1.6.1-4B8BF5" alt="version">
   <img src="https://img.shields.io/badge/语言-Python%203.10%2B-3776AB" alt="python">
   <img src="https://img.shields.io/badge/许可证-MIT-green" alt="license">
   <img src="https://img.shields.io/badge/数据库-SQLite%20%2B%20FTS5%20trigram-blue" alt="db">
@@ -40,7 +40,9 @@
 - **中文检索优化**：FTS5 `trigram` 分词（中文按 3 字滑窗），≥3 字走全文索引、<3 字自动回退 LIKE，不丢短词
 - **RRF 多信号混合检索**：FTS(BM25) + LIKE + 实体 + 语义向量 四路融合，短词也能命中，检索精度显著提升
 - **时间感知检索**：`recall --days N` 只召回最近 N 天；时间衰减排序（高价值记忆永不衰减，普通记忆按年龄降权）
-- **记忆生命周期管理**：`importance` 自动分级（铁律/决策/踩坑=high，事件=low）+ 过期降权 + 重复合并（`lifecycle --audit/--apply/--dedupe`）
+- **记忆生命周期管理**：`importance` 自动分级（铁律/决策/踩坑=high，事件=low）+ 过期降权 + 重复合并（`lifecycle --audit / --apply / --dedupe`，去重**默认只预演**，加 `--apply` 才落库）
+- **可撤销的合并**：合并采用 tombstone 标记而非物理删除，`lifecycle --unmerge <id>` 可随时撤销；被标记的碎片不再出现在检索结果与开工上下文中
+- **变更审计**：`memory_mutations` 表记录「谁改了什么」（与只记检索的 `memory_retrieval_audits` 互补），记忆的变更历史可回溯
 - **主动提取**：`summarize.py` 自动汇总近期 event 碎片 → 滚动摘要 + 升级高价值碎片，防止「记得的内容被遗忘」
 - **检索审计**：Web 界面「检索记录」tab 可视化每次检索的召回来源与命中，检索行为可回溯
 - **四层数据模型**：
@@ -52,6 +54,28 @@
 - **记忆防遗忘**：`recall` 带回「滚动摘要 + 记忆碎片 + 关联实体」，长会话开工即带上文
 - **Web 界面**：搜索 / 录入 / 浏览 / 实体关系图 / AI 问答 / 今日看板 / 检索记录
 - **MCP 服务器**：把记忆库暴露为标准 MCP 工具，可接入豆包等支持 MCP 的 AI 客户端
+
+---
+
+## 界面预览
+
+> 以下截图全部取自**虚构的演示数据**（`tools/_seed_demo.py` 可一键复现），不含任何真实内容。
+
+| 统一搜索（记忆 / 实体 / 内容 / 知识库 一次命中） | 实体关系查询 |
+|---|---|
+| ![搜索](docs/screenshots/01-搜索.png) | ![实体关系](docs/screenshots/03-实体关系.png) |
+
+| 关系图谱可视化 | 检索审计（召回来源可回溯） |
+|---|---|
+| ![关系图谱](docs/screenshots/04-关系图谱.png) | ![检索记录](docs/screenshots/05-检索记录.png) |
+
+| 今日工作看板 / 开工上下文 | 内容实体浏览 |
+|---|---|
+| ![今日看板](docs/screenshots/06-今日看板.png) | ![浏览](docs/screenshots/02-浏览.png) |
+
+| 记忆碎片 / 内容 / 实体录入 | 社交分享预览图 |
+|---|---|
+| ![录入](docs/screenshots/07-录入.png) | ![社交预览](docs/social-preview.png) |
 
 ---
 
@@ -152,7 +176,13 @@ python cyber_brain.py --db cyber_brain.db conv --append --id 1 --role user --tex
 - `lifecycle` 命令：
   - `lifecycle --audit`：只读审计（缺 importance / 过期低优先碎片）
   - `lifecycle --apply`：自动修复（补分级 + 30 天以上降权）
-  - `lifecycle --dedupe`：重复碎片合并（相似度阈值 0.8，可 --dry-run 预演）
+  - `lifecycle --dedupe`：**只预演**，列出疑似重复对（相似度阈值 0.8）
+  - `lifecycle --dedupe --apply`：真正落库 —— 把后写者标记为 `merged`（不删原文）
+  - `lifecycle --unmerge <id>`：撤销合并，把碎片从 `merged` 改回 `active`
+
+> 设计取舍：**合并默认不落库**。重复判定是启发式的，误合并的代价比漏合并高，
+> 所以先让人看预演结果再决定。标记而非删除，是为了保留可追溯性与可撤销性。
+> 被标记为 `merged` 的碎片不会出现在检索结果与开工上下文里。
 
 ### 主动提取（summarize.py）
 
@@ -206,6 +236,7 @@ memory_fragments (+ fragment_fts)        # 记忆碎片（8 类，含 importance
 rolling_summaries                        # 滚动摘要 checkpoint
 memory_relations                         # 碎片间关系
 memory_retrieval_audits                  # 检索留痕（审计可视化数据源）
+memory_mutations                         # 变更留痕（谁改了什么，与检索审计互补）
 ```
 
 ## 向量检索
@@ -220,13 +251,27 @@ memory_retrieval_audits                  # 检索留痕（审计可视化数据�
 ## 测试
 
 ```bash
-# Web 界面冒烟（需 Playwright）
+# 核心测试套件（19 条断言，无需外部依赖，跑在临时库上）
+python tools/test_cyber_brain.py
+
+# 版本号一致性（__version__ ↔ README 徽章 ↔ git tag）
+python tools/check_version.py --tag
+
+# Web 界面冒烟（需 Playwright + 已启动 python web_ui.py）
 python tools/_frontend_smoke.py
 # 图谱冒烟
 python tools/_graph_smoke.py
 # 碎片去重扫描（只读）
 python tools/_dup_scan.py
+
+# 生成一份虚构演示数据（用于界面截图 / 本地试玩）
+python tools/_seed_demo.py
 ```
+
+> `test_cyber_brain.py` 的设计取向：**测命令，而不只是测函数** ——
+> 核心断言落在「执行之后数据真的变了」这一层。例如
+> `lifecycle --dedupe --apply` 之后必须真的有一条碎片变成 `merged`，
+> 而不只是函数返回了一个数字。
 
 ## 项目结构
 
@@ -243,6 +288,70 @@ requirements.txt        # 依赖
 docs/                   # 文档与架构图（architecture.svg）
 tools/                  # 测试与工具脚本
 ```
+
+---
+
+## 常见问题（FAQ）
+
+**和 Mem0 / Letta(MemGPT) / Zep 这类记忆框架有什么不同？**
+定位不同。那些是给 Agent 用的记忆层 SDK / 服务；本项目的重心是「单机、单文件、自己完全掌控」的记忆 + 知识库 ——
+把 RAG 知识库、记忆碎片、实体关系、混合检索装进一个 SQLite 文件，零服务依赖、可离线。
+不追求做通用框架，也不替代它们。它的场景是：**拷一个文件，就能带走全部记忆。**
+
+**为什么用 SQLite 而不是专门的向量数据库？**
+在个人 / 小团队的量级（数千到数十万条）下，SQLite + FTS5 完全够用，换来三个实际好处：
+备份 = 拷文件、换机零迁移、无外部服务需要维护。向量用 fastembed + ONNX 本地推理，向量也存库内。
+真到更大规模，`kb_embedding` 这一层可以平滑迁到 pgvector。
+
+**中文检索为什么不能直接用默认分词？**
+SQLite FTS5 自带的 `unicode61` 按空格切词，而中文没有空格 —— 直接用它几乎检索不出东西。
+本项目改用 `trigram`（按 3 字滑窗）建索引，并保留「不足 3 字自动回退 LIKE」的兜底。
+
+**RRF 是什么？为什么需要四路融合？**
+Reciprocal Rank Fusion。单一向量检索对短词和专有名词不稳，单一全文检索对语义改写不稳。
+四路（FTS-BM25 / LIKE / 实体 / 语义向量）各自召回后按 `1/(k+rank)` 累加重排，互相补位。
+
+**会不会把我的数据传出去？**
+默认不会。全文检索、向量计算（本地 ONNX 推理）、存储都在本机完成。
+只有你主动配置了云端模型（例如把 AI 问答接到外部 API）时才会出网。
+
+**数据怎么备份 / 换机？**
+拷 `cyber_brain.db` 一个文件即可 —— 文档、碎片、实体、向量全在里面。
+
+**记忆会无限膨胀吗？**
+有生命周期管理：`importance` 自动分级、30 天以上的低价值事件自动降权、重复碎片可合并（可撤销）。
+检索侧还有时间衰减排序，防止旧记忆淹没新记忆。
+
+**能接哪些 AI 客户端？**
+任何支持 MCP 的客户端。仓库内附了豆包（Doubao）的接入说明 `MCP接入豆包指南.md`；
+其他客户端只需把 MCP 服务器地址填进配置。
+
+**这是生产可用的项目吗？**
+诚实地说：它是一个**能实际运行、也确实被长期使用**的个人项目，但不是经过大规模验证的成熟框架。
+已有测试套件覆盖核心命令，但仍有许多边界未被覆盖 —— 见下节「第三方审阅」。
+
+---
+
+## 第三方审阅
+
+本项目的代码曾被一个第三方记忆系统调研收录，并做了逐行、带锚点的代码审查：
+
+**[Agent Memory Atlas · huiran-cerebro](https://neoneye.github.io/agent-memory-atlas/systems/huiran-cerebro/)**
+—— 由 Simon Strandgaard 维护的 AI 记忆系统图谱（收录 700+ 系统），
+以固定的 7 项机制对每个项目打分：tombstone / trust state / bi-temporal / scope enforced /
+mutation audit / human review / negative evals。
+
+对 v1.5.0（commit `2f48deb`）的评级是 **0/7**。指出的问题集中在同一类毛病：
+**机制已经写出来了，但没有接线**——例如重复检测的函数存在、调用点却永远传预览参数；
+合并标记写进了库、检索侧却不过滤 `status`。
+
+**v1.6.0 逐条修复了这些问题**：去重改为两段式（默认预演 / `--apply` 落库）、
+检索与开工上下文全面补 `status` 谓词、修掉 `namespace` 缺列导致的查询报错、
+新增变更审计表与撤销合并命令、补上首个测试套件。完整记录见 [CHANGELOG](CHANGELOG.md)。
+
+> 关于这个评级的语境：该图谱自己的统计显示，其收录的系统中 **44% 同样是 0 或 1 项**；
+> 其方法论也明确说明，未标记表示「**在该 commit 上未找到该机制**」，
+> 而不代表系统需要它。我们仍然认为这份审查是准确且有价值的。
 
 ---
 

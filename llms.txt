@@ -1,6 +1,8 @@
 # Huiran-cerebro
 
 > AI 可读的项目导航（llms.txt 规范）。人类读者请看 [README.md](README.md)。
+> 需要更完整的参考（含设计取舍、常用命令、测试与审阅记录）请见 **[llms-full.txt](llms-full.txt)**。
+> 项目主页：<https://qilunuojiang9-hue.github.io/Huiran-cerebro/>
 
 ## 项目一句话
 
@@ -68,16 +70,20 @@ python mcp_server.py
 
 ## 关键文件
 
-- [README.md](README.md) — 完整文档
+- [README.md](README.md) — 完整文档（含 FAQ、界面预览、第三方审阅）
+- [llms-full.txt](llms-full.txt) — 给 LLM 的完整参考（本文件的详细版）
+- [CHANGELOG.md](CHANGELOG.md) — 版本变更记录
+- [CITATION.cff](CITATION.cff) — 引用信息
 - [MCP接入豆包指南.md](MCP%E6%8E%A5%E5%85%A5%E8%B1%86%E5%8C%85%E6%8C%87%E5%8D%97.md) — MCP 接入教程
 - [COLLAB.md](COLLAB.md) — AI 协作规约
 - [docs/architecture.svg](docs/architecture.svg) — 架构图
+- [docs/screenshots/](docs/screenshots/) — 界面截图（虚构演示数据）
 - `cyber_brain.py` — 核心引擎（RRF 检索 + 生命周期 + 时间感知）
 - `web_ui.py` — Web 界面（含检索记录审计 tab）
 - `mcp_server.py` — MCP 服务器
 - `session_log.py` — 会话自动打卡
 - `summarize.py` — 主动提取（滚动摘要 + 碎片升级）
-- `tools/` — 测试与工具脚本
+- `tools/` — 测试与工具脚本（`test_cyber_brain.py` / `check_version.py` / `_seed_demo.py`）
 
 ## 典型使用场景
 
@@ -89,5 +95,8 @@ python mcp_server.py
 
 ## 参考资源
 
+- 项目主页（GitHub Pages）：<https://qilunuojiang9-hue.github.io/Huiran-cerebro/>
+- [Agent Memory Atlas 收录页](https://neoneye.github.io/agent-memory-atlas/systems/huiran-cerebro/) — 第三方代码审查
 - [llms.txt 规范](https://llmstxt.org/) — 本项目 llms.txt 遵循此规范
+- [MCP 协议](https://modelcontextprotocol.io/) — 本项目 MCP 服务器遵循此协议
 - [Anthropic 文档最佳实践](https://www.anthropic.com/news/writing-prompt-for-ai-docs)
