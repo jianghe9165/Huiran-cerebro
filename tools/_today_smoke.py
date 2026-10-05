@@ -1,7 +1,10 @@
 # -*- coding: utf-8 -*-
 """今日看板前端冒烟：打开 Web UI → 点「今日」tab → 验证渲染"""
-from playwright.sync_api import sync_playwright
+import datetime
 import sys
+
+from playwright.sync_api import sync_playwright
+
 
 def main():
     with sync_playwright() as p:
@@ -16,9 +19,12 @@ def main():
         # 验证渲染内容
         body = pg.inner_text("body")
         ok_tab = "今日工作" in body
-        ok_date = "2026-09-10" in body
+        # 日期取当天，不写死 —— 写死会在第二天必然失败
+        # （外部审查 2026-09-28 点名此处："硬编码的 2026 年 9 月 10 日日期"）
+        today = datetime.date.today().isoformat()
+        ok_date = today in body
         ok_event = "打卡碎片" in body
-        print(f"tab可见={ok_tab} 日期={ok_date} 碎片={ok_event}")
+        print(f"tab可见={ok_tab} 日期({today})={ok_date} 碎片={ok_event}")
         print(f"console errors: {len(errors)}")
         if errors:
             print("  ".join(errors[:5]))
@@ -27,6 +33,7 @@ def main():
         if not (ok_tab and ok_date):
             sys.exit(1)
         print("SMOKE PASS")
+
 
 if __name__ == "__main__":
     main()

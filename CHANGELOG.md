@@ -5,6 +5,53 @@
 
 ---
 
+## [1.6.0] — 2026-10-05
+
+> 本版是对一份外部代码审查的回应。**Agent Memory Atlas**
+> （`neoneye.github.io/agent-memory-atlas/systems/huiran-cerebro/`）在 2026-09-28
+> 针对 `2f48deb` 出具了逐行带锚点的报告，指出若干机制「已声明但未接线」。
+> 下面每一条都能对应到那份报告的具体指控。
+
+### 修复
+
+- **去重此前永远不落库（最核心的一条）**：命令行分支 `lifecycle --dedupe` 硬编码了
+  `dry_run=True`，而 `dedupe_fragments()` 的默认值是 `dry_run=False`——
+  唯一调用点偏偏传了预览值，于是重复碎片检测**永远只打印、从不写库**。
+  提示语还写着「重跑会实际标记」，实际重跑仍是预览。
+  现在与 `--apply` 一致走两段式：默认预演，加 `--apply` 才真正标记。
+  同时修正 `--dedupe` 的 help 文案（原文写「保留新者标记」，
+  与实际实现「保留先创建者、标记后写者」相反）。
+- **合并结果不被检索尊重**：`search_memory()` 以及 `daily_context()` 的三处读取
+  （铁律 / 最近决策 / 高价值知识）此前都不带 `status` 谓词，
+  标记为 `merged` 的碎片照样被搜出来、照样进开工上下文。已全部补上。
+- **语义检索支路同样漏过滤**：`recall()` 按 id 回取碎片时未校验 status，
+  已合并但早先建过索引的碎片会保留向量并被取回。已修。
+- **带 namespace 调用会直接报错**：`namespace` 列此前只声明在 `memory_fragments` 上，
+  但统一搜索的 scoped 分支会向 `entity` / `content_item` / `kb_document` 发送
+  `AND namespace=?`，而这三张表没有该列 → SQL 报 `no such column`。
+  现已在启动迁移中为这三张表补列（幂等，旧库自动升级）。
+- **去重是纯两两全比对**：加长度预筛（Jaccard 不可能超过 min/max 长度比），
+  显著降低实际比较量。
+- **`tools/_today_smoke.py` 硬编码日期**：写死了 `2026-09-10`，第二天必然失败。改为动态取当天。
+
+### 新增
+
+- **`lifecycle --unmerge <id>`**：撤销合并，把碎片从 `merged` 改回 `active`。
+  合并本身不删原文，所以恢复只是状态回滚。
+- **变更审计表 `memory_mutations`**：记录「谁改了什么」（merge / unmerge …），
+  与既有的 `memory_retrieval_audits`（只记检索）语义互补——
+  外部审查指出原审计表记的是**检索**而非**变更**。新增 `list_mutations()` 读取接口。
+- **`tools/test_cyber_brain.py`**：首个测试套件（19 条断言）。
+  按审查建议「**测命令，而不只是测函数**」，核心断言落在「执行后数据真的变了」这一层——
+  正是能抓住上述去重 bug 的那一条。
+
+### 数据兼容性
+
+无破坏性变更。启动时自动迁移（补 namespace 列 + 建 `memory_mutations` 表），
+旧库可直接使用。
+
+---
+
 ## [1.5.0] — 2026-09-16
 
 ### 新增

@@ -43,3 +43,7 @@ Thumbs.db
 
 # 临时提交消息
 .commit_msg_tmp.txt
+
+# 同步脚本产生的临时备份（不入库）
+*.before_sync
+*.before_reverse_sync

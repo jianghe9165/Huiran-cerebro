@@ -25,7 +25,7 @@ import datetime
 __all__ = ["CyberBrain", "ENTITY_TYPES", "CONTENT_TYPES", "FRAGMENT_TYPES"]
 
 # 版本号单一事实源：改这里，然后跑 tools/check_version.py 同步 README 徽章
-__version__ = "1.5.0"
+__version__ = "1.6.0"
 
 ENTITY_TYPES = ["person", "org", "project", "account", "platform", "product", "tool", "other"]
 CONTENT_TYPES = ["note", "article", "task", "decision", "meeting", "idea", "issue", "report"]
@@ -224,6 +224,20 @@ CREATE TABLE IF NOT EXISTS memory_retrieval_audits (
   fallback_reason TEXT,
   created_at TEXT DEFAULT (datetime('now','localtime'))
 );
+
+-- 变更审计（2026-10-05 新增）
+-- 上面的表记录的是「检索」，本表记录「谁改了什么」——两者语义不同，不可互相替代。
+-- 对应外部审查指出的："the audit table records retrievals, not mutations"
+CREATE TABLE IF NOT EXISTS memory_mutations (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  action TEXT NOT NULL,              -- merge / unmerge / link_expire / purge ...
+  target_type TEXT NOT NULL,         -- memory_fragment / entity_link / ...
+  target_id INTEGER,
+  detail TEXT DEFAULT '{}',          -- JSON：改动前后的值
+  created_at TEXT DEFAULT (datetime('now','localtime'))
+);
+CREATE INDEX IF NOT EXISTS idx_mutations_target ON memory_mutations(target_type, target_id);
+
 CREATE TABLE IF NOT EXISTS memory_relations (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   from_frag_id INTEGER NOT NULL,
@@ -311,6 +325,20 @@ class CyberBrain:
             self.con.commit()
         except Exception:
             pass
+
+        # 迁移：给 entity / content_item / kb_document 补 namespace 列（幂等）
+        # 2026-10-05 修：此前 namespace 只声明在 memory_fragments 上，但统一搜索的 scoped 分支
+        # 会向这些表发送 "AND namespace=?"，于是带 namespace 调用直接 SQL 报错
+        # （外部审查："The scoped branch of the unified search names a column those tables lack."）
+        for _tbl in ("entity", "content_item", "kb_document"):
+            try:
+                _cols = [r[1] for r in self.con.execute("PRAGMA table_info(%s)" % _tbl)]
+                if _cols and "namespace" not in _cols:
+                    self.con.execute(
+                        "ALTER TABLE %s ADD COLUMN namespace TEXT NOT NULL DEFAULT 'default'" % _tbl)
+            except Exception:
+                pass
+        self.con.commit()
         self.con.commit()
         self._vec_engine = None
         # AI 电脑中枢：初始化默认系统台账（幂等）
@@ -660,7 +688,10 @@ class CyberBrain:
         rows = []
         for i in list(ids)[:limit * 4]:
             r = self.con.execute("SELECT * FROM memory_fragments WHERE id=?", (i,)).fetchone()
-            if r and (not namespace or r["namespace"] == namespace):
+            # 2026-10-05 修：必须过滤 status。此前只查 namespace，导致被标记 merged 的碎片
+            # 照样被搜出来 —— 对应外部审查：
+            # "Were the mark written, the searches would not read it."
+            if r and r["status"] == "active" and (not namespace or r["namespace"] == namespace):
                 rows.append(r)
         # P1 decay：importance=high 加权；普通碎片按创建时间衰减（只降权不删除）
         rows.sort(key=lambda r: self._decay_key(r), reverse=True)
@@ -842,6 +873,11 @@ class CyberBrain:
         for i in range(len(rows)):
             for j in range(i + 1, len(rows)):
                 a, b = rows[i], rows[j]
+                # 长度预筛：Jaccard 不可能超过 min/max 长度比，差异大就直接跳过。
+                # 这一条把实际比较量从 O(n²) 压下来（外部审查指出原本是纯两两扫描）。
+                la, lb = len(a["content"] or ""), len(b["content"] or "")
+                if la and lb and min(la, lb) / max(la, lb) < threshold:
+                    continue
                 if a["content"] == b["content"]:
                     sim = 1.0
                 else:
@@ -854,9 +890,27 @@ class CyberBrain:
                             "UPDATE memory_fragments SET status='merged', updated_at=datetime('now','localtime') "
                             "WHERE id=?", (b["id"],))
                         merged += 1
+                        # 变更审计（2026-10-05 新增）：记下「谁被并到谁」，可追溯
+                        self._log_mutation("merge", "memory_fragment", b["id"],
+                                           {"kept_id": a["id"], "sim": round(sim, 3)})
         if not dry_run:
             self.con.commit()
         return {"candidates": cand[:50], "merged_count": merged}
+
+    def unmerge_fragment(self, fragment_id):
+        """撤销合并：把 status='merged' 的碎片改回 'active'。
+
+        对应审查里的 Open Question「被 merged 的碎片能否恢复」—— 现在可以了。
+        合并本身就不删原文，所以恢复只是把状态改回来。
+        """
+        cur = self.con.execute(
+            "UPDATE memory_fragments SET status='active', updated_at=datetime('now','localtime') "
+            "WHERE id=? AND status='merged'", (fragment_id,))
+        self.con.commit()
+        if cur.rowcount:
+            self._log_mutation("unmerge", "memory_fragment", fragment_id,
+                               {"from": "merged", "to": "active"})
+        return cur.rowcount
 
     def add_rolling_summary(self, scope_key, summary, start_ref=None, end_ref=None, version=None):
         if version is None:
@@ -901,6 +955,26 @@ class CyberBrain:
         except Exception:
             pass
 
+    def _log_mutation(self, action, target_type, target_id, detail=None):
+        """记录一次**变更**（与 _audit 记录的「检索」严格区分）。
+
+        2026-10-05 新增，对应外部审查指出的
+        "the audit table records retrievals, not mutations"。
+        审计是旁路：写失败不影响主流程。
+        """
+        try:
+            self.con.execute(
+                "INSERT INTO memory_mutations(action,target_type,target_id,detail) VALUES(?,?,?,?)",
+                (action, target_type, target_id, _jl(detail or {})))
+            self.con.commit()
+        except Exception:
+            pass
+
+    def list_mutations(self, limit=20):
+        """最近的变更记录（谁改了什么）。"""
+        return self.con.execute(
+            "SELECT * FROM memory_mutations ORDER BY id DESC LIMIT ?", (limit,)).fetchall()
+
     def recall(self, query=None, top_summaries=2, limit=8, days=None):
         """防遗忘：按请求命中记忆碎片 + 滚动摘要，输出紧凑上下文。
         days>0 时只召回最近 N 天（时间感知 P0-2）；碎片经 RRF 混合排序。
@@ -917,7 +991,11 @@ class CyberBrain:
                     if h["id"] in seen:
                         continue
                     row = self.con.execute(
-                        "SELECT content FROM memory_fragments WHERE id=?", (h["id"],)).fetchone()
+                        # 语义检索这条支路也必须过滤 status —— 否则「已合并的碎片会保留向量、
+                        # 仍被按 id 取回」（外部审查原话：a fragment merged before its first
+                        # indexing gets no embedding, but one indexed earlier keeps its vector）
+                        "SELECT content FROM memory_fragments WHERE id=? AND status='active'",
+                        (h["id"],)).fetchone()
                     if row:
                         frags.append({"fragment_type": "semantic", "id": h["id"], "content": row["content"]})
             except Exception:
@@ -1196,8 +1274,28 @@ class CyberBrain:
             self.con.execute(
                 "INSERT OR REPLACE INTO embeddings(target_type,target_id,vector,model) VALUES(?,?,?,?)",
                 (t, i, v.tobytes(), "bge-small-zh-v1.5"))
+        # 让 embedding_state 字段真正有意义（2026-10-05）：
+        # 外部审查指出它"默认为 disabled，且模式定义之后再无任何一行读或写它"。
+        # 现在索引完成后把对应碎片的 state 置为 indexed，
+        # 于是「哪些碎片还没建向量」变成可查询的事实，而不是一个死字段。
+        frag_ids = [i for (t, i, _) in todo if t == "memory_fragment"]
+        if frag_ids:
+            q = ",".join("?" * len(frag_ids))
+            self.con.execute(
+                "UPDATE memory_fragments SET embedding_state='indexed' WHERE id IN (%s)" % q,
+                frag_ids)
         self.con.commit()
         return len(todo)
+
+    def list_unindexed_fragments(self, limit=50):
+        """还没建向量的 active 碎片（embedding_state != 'indexed'）。
+
+        与 index_vectors() 配套：索引是增量的，本方法用来查还差哪些。
+        """
+        return self.con.execute(
+            "SELECT id, fragment_type, subject, created_at FROM memory_fragments "
+            "WHERE status='active' AND (embedding_state IS NULL OR embedding_state != 'indexed') "
+            "ORDER BY id LIMIT ?", (limit,)).fetchall()
 
     def search_semantic(self, q, limit=10, target_types=None, namespace=None):
         """语义检索：本地向量余弦。embeddings 空时自动先建索引。"""
@@ -1266,9 +1364,12 @@ class CyberBrain:
         lines = []
         for s in self.con.execute("SELECT * FROM rolling_summaries ORDER BY id DESC LIMIT 1"):
             lines.append(f"[滚动摘要] {s['summary']}")
+        # 铁律：status='active' 过滤不能少 —— 合并过的碎片不该再出现在开工上下文里。
+        # 外部审查 2026-09-28 点名此处："缺失的 status 谓词位于会话启动的 context builder 中，
+        # 而非搜索路径"。context builder 返回散文而非行，所以最容易漏。
         for r in self.con.execute(
-                "SELECT content FROM memory_fragments WHERE source_ref LIKE 'iron_rules%' "
-                "ORDER BY id"):
+                "SELECT content FROM memory_fragments WHERE status='active' "
+                "AND source_ref LIKE 'iron_rules%' ORDER BY id"):
             lines.append(f"[铁律] {r['content']}")
         logs = self.con.execute(
             "SELECT title, body FROM content_item WHERE category='工作日志' "
@@ -1321,17 +1422,19 @@ class CyberBrain:
             lines.append("[提醒·未完成] 上次还没做完的事：")
             for r in todo:
                 lines.append(f"  · {r['title']}（{r['status']}）")
-        # ② 最近决策（最近 5 条 decision）
+        # ② 最近决策（最近 5 条 decision）—— status 过滤同样不能漏
         dec = self.con.execute(
-            "SELECT content FROM memory_fragments WHERE fragment_type='decision' "
+            "SELECT content FROM memory_fragments WHERE status='active' "
+            "AND fragment_type='decision' "
             "ORDER BY created_at DESC LIMIT 5").fetchall()
         if dec:
             lines.append("[提醒·最近决策]")
             for r in dec:
                 lines.append(f"  · {(r['content'] or '')[:70]}")
-        # ③ 高价值知识（importance=high，若已启用）
+        # ③ 高价值知识（importance=high，若已启用）—— status 过滤同样不能漏
         hi = self.con.execute(
-            "SELECT content FROM memory_fragments WHERE importance='high' "
+            "SELECT content FROM memory_fragments WHERE status='active' "
+            "AND importance='high' "
             "ORDER BY created_at DESC LIMIT 5").fetchall()
         if hi:
             lines.append("[提醒·高价值知识]")
@@ -1464,9 +1567,13 @@ def _main(argv=None):
 
     plife = sub.add_parser("lifecycle", help="记忆生命周期管理（P1）")
     plife.add_argument("--audit", action="store_true", help="扫描 importance 缺失/过期事件（只读）")
-    plife.add_argument("--apply", action="store_true", help="自动修复：补 importance + 降权 30 天以上事件")
-    plife.add_argument("--dedupe", action="store_true", help="重复碎片合并（Jaccard>0.8 内容高重叠，保留新者标记）")
+    plife.add_argument("--apply", action="store_true",
+                       help="配合 --dedupe 使用表示「实际执行」；单独使用＝自动修复 importance + 降权 30 天以上事件")
+    plife.add_argument("--dedupe", action="store_true",
+                       help="重复碎片合并：默认只预演；加 --apply 才会实际标记（保留先创建者，标记后写者为 merged，不删原文）")
     plife.add_argument("--threshold", type=float, default=0.8, help="去重相似度阈值（默认 0.8）")
+    plife.add_argument("--unmerge", type=int, metavar="ID",
+                       help="撤销合并：把指定碎片恢复为 active")
 
     psr = sub.add_parser("search", help="统一搜索")
     psr.add_argument("query")
@@ -1642,20 +1749,36 @@ def _main(argv=None):
                 print(f"  过期 {s['age_days']}天 #{s['id']} [{s['type']}] {s['content']}")
             if rep["stale_low"]:
                 print("  提示: 跑 lifecycle --apply 自动降权；跑 lifecycle --dedupe 合并重复")
+        elif args.unmerge is not None:
+            n = db.unmerge_fragment(args.unmerge)
+            if n:
+                print(f"[已恢复] #{args.unmerge} 从 merged 改回 active ✅（会重新出现在检索与上下文中）")
+            else:
+                print(f"#{args.unmerge} 不是 merged 状态（或不存在），未改动")
+        elif args.dedupe:
+            # 2026-10-05 修：此前这里硬编码 dry_run=True，导致去重永远只预览、从不落库。
+            # 现在与 --apply 一样走两段式：默认预演，加 --apply 才真写。
+            dry = not args.apply
+            rep = db.dedupe_fragments(threshold=args.threshold, dry_run=dry)
+            if dry:
+                print(f"[预演] 发现 {len(rep['candidates'])} 对重复碎片（阈值 {args.threshold}）")
+                for c in rep["candidates"][:10]:
+                    print(f"  #{c['a_id']} ≈ #{c['b_id']} (sim {c['sim']}) {c['a']}")
+                if rep["candidates"]:
+                    print(f"  确认后执行：lifecycle --dedupe --apply"
+                          f"（把后写者标记为 merged，原文保留，可用 --unmerge <id> 恢复）")
+                else:
+                    print("  没有需要合并的重复碎片。")
+            else:
+                print(f"[已执行] 标记 {rep['merged_count']} 条后写碎片为 merged"
+                      f"（原文保留；恢复用 lifecycle --unmerge <id>）✅")
         elif args.apply:
             rep = db.lifecycle_apply(dry_run=True)
             print(f"[预演] 将修复 {rep['importance_fixed']} 条 importance，降权 {rep['demoted_stale']} 条过期碎片")
             rep = db.lifecycle_apply(dry_run=False)
             print(f"[已执行] 修复 {rep['importance_fixed']} 条 importance，降权 {rep['demoted_stale']} 条过期碎片 ✅")
-        elif args.dedupe:
-            rep = db.dedupe_fragments(threshold=args.threshold, dry_run=True)
-            print(f"[预演] 发现 {len(rep['candidates'])} 对重复碎片（阈值 {args.threshold}）")
-            for c in rep["candidates"][:10]:
-                print(f"  #{c['a_id']} ≈ #{c['b_id']} (sim {c['sim']}) {c['a']}")
-            if rep["candidates"]:
-                print("  提示: 重跑加 --dedupe 会实际标记后写者为 merged（不删原文）")
         else:
-            print("lifecycle: 需要 --audit / --apply / --dedupe")
+            print("lifecycle: 需要 --audit / --dedupe [--apply] / --apply / --unmerge <id>")
 
     elif args.cmd == "search":
         res = db.search(args.query)
