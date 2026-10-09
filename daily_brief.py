@@ -61,7 +61,8 @@ elif bak and str(bak).startswith("ERR:"):
 # 开工检查：昨天有没有记 event（防遗忘）
 yesterday = (datetime.date.today() - datetime.timedelta(days=1)).isoformat()
 cnt = b.con.execute(
-    "SELECT COUNT(*) FROM memory_fragments WHERE fragment_type='event' AND created_at LIKE ?",
+    "SELECT COUNT(*) FROM memory_fragments WHERE fragment_type='event' "
+    "AND status='active' AND created_at LIKE ?",
     (yesterday + "%",)).fetchone()[0]
 if cnt == 0:
     lines.append("")

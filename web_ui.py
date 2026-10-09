@@ -432,7 +432,7 @@ def api_daily():
     today = datetime.date.today().isoformat()
     events = db.con.execute(
         "SELECT id, content, created_at FROM memory_fragments "
-        "WHERE fragment_type='event' AND created_at LIKE ? ORDER BY id DESC",
+        "WHERE fragment_type='event' AND status='active' AND created_at LIKE ? ORDER BY id DESC",
         (today + "%",)).fetchall()
     logs = db.con.execute(
         "SELECT id, title, body, category, updated_at FROM content_item "
