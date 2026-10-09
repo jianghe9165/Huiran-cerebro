@@ -353,20 +353,24 @@ class CyberBrain:
 
     # ------------------------------------------------- 实体
     def add_entity(self, etype, name, org=None, role=None, contact=None, tags=None,
-                   meta=None, source_tag="manual", authorization_ref="manual", if_exists="skip"):
+                   meta=None, source_tag="manual", authorization_ref="manual", if_exists="skip",
+                   namespace=None):
         name = (name or "").strip()
         if not name:
             raise ValueError("name 必填")
         if etype not in ENTITY_TYPES:
             raise ValueError(f"type 必须是 {ENTITY_TYPES}")
+        ns = namespace or "default"
         if if_exists == "skip":
-            r = self.con.execute("SELECT id FROM entity WHERE name=? AND type=?", (name, etype)).fetchone()
+            # 判重按 namespace 隔离：不传 namespace 时落在 "default"，与历史行为一致
+            r = self.con.execute("SELECT id FROM entity WHERE name=? AND type=? AND namespace=?",
+                                 (name, etype, ns)).fetchone()
             if r:
                 return r["id"]
         cur = self.con.execute(
-            "INSERT INTO entity(type,name,org,role,contact_json,tags_json,meta_json,source_tag,authorization_ref)"
-            " VALUES(?,?,?,?,?,?,?,?,?)",
-            (etype, name, org, role, _jl(contact), _jl(tags), _jl(meta), source_tag, authorization_ref))
+            "INSERT INTO entity(type,name,org,role,contact_json,tags_json,meta_json,source_tag,authorization_ref,namespace)"
+            " VALUES(?,?,?,?,?,?,?,?,?,?)",
+            (etype, name, org, role, _jl(contact), _jl(tags), _jl(meta), source_tag, authorization_ref, ns))
         self.con.commit()
         return cur.lastrowid
 
@@ -436,16 +440,17 @@ class CyberBrain:
     # ------------------------------------------------- 内容
     def add_content(self, title, body="", ctype="note", status="draft", category=None, platform=None,
                     tags=None, entity_ids=None, body_json=None, source_type="manual",
-                    source_tag="manual", authorization_ref="manual", parent_id=None, keyword_refs=None):
+                    source_tag="manual", authorization_ref="manual", parent_id=None, keyword_refs=None,
+                    namespace=None):
         if ctype not in CONTENT_TYPES:
             raise ValueError(f"content_type 必须是 {CONTENT_TYPES}")
         cur = self.con.execute(
             "INSERT INTO content_item(content_type,title,body,body_json,status,category,platform,"
-            "tags_json,entity_ids,source_type,source_tag,authorization_ref,parent_id,keyword_refs_json)"
-            " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            "tags_json,entity_ids,source_type,source_tag,authorization_ref,parent_id,keyword_refs_json,namespace)"
+            " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (ctype, title, body, body_json, status, category, platform,
              _jl(tags), _jl(entity_ids), source_type, source_tag, authorization_ref,
-             parent_id, _jl(keyword_refs)))
+             parent_id, _jl(keyword_refs), namespace or "default"))
         self.con.commit()
         return cur.lastrowid
 
@@ -531,10 +536,10 @@ class CyberBrain:
 
     # ------------------------------------------------- 知识库（RAG 底座）
     def add_document(self, title, text, source=None, source_tag="manual",
-                     authorization_ref="manual", chunk_size=500, overlap=50):
+                     authorization_ref="manual", chunk_size=500, overlap=50, namespace=None):
         cur = self.con.execute(
-            "INSERT INTO kb_document(title,source,source_tag,authorization_ref) VALUES(?,?,?,?)",
-            (title, source, source_tag, authorization_ref))
+            "INSERT INTO kb_document(title,source,source_tag,authorization_ref,namespace) VALUES(?,?,?,?,?)",
+            (title, source, source_tag, authorization_ref, namespace or "default"))
         doc_id = cur.lastrowid
         text = text or ""
         step = max(chunk_size - overlap, 50)
@@ -653,15 +658,16 @@ class CyberBrain:
         return imp
 
     def add_fragment(self, ftype, content, subject="work", tags=None, entities=None, source_ref=None,
-                     importance=None):
+                     importance=None, namespace=None):
         if ftype not in FRAGMENT_TYPES:
             raise ValueError(f"fragment_type 必须是 {FRAGMENT_TYPES}")
         if importance is None:
             importance = self._auto_importance(ftype, content)
         cur = self.con.execute(
-            "INSERT INTO memory_fragments(fragment_type,subject,content,entities,tags,source_ref,importance) "
-            "VALUES(?,?,?,?,?,?,?)",
-            (ftype, subject, content, _jl(entities), _jl(tags), source_ref, importance))
+            "INSERT INTO memory_fragments(fragment_type,subject,content,entities,tags,source_ref,importance,namespace) "
+            "VALUES(?,?,?,?,?,?,?,?)",
+            (ftype, subject, content, _jl(entities), _jl(tags), source_ref, importance,
+             namespace or "default"))
         self.con.commit()
         return cur.lastrowid
 
@@ -1501,6 +1507,8 @@ def _main(argv=None):
     pe.add_argument("--org")
     pe.add_argument("--role")
     pe.add_argument("--if-exists", default="skip")
+    pe.add_argument("--namespace", default=None,
+                    help="记忆分区（默认 default；用于隔离不同用途的记忆）")
     pe.add_argument("--list", action="store_true")
     pe.add_argument("--search")
 
@@ -1519,6 +1527,8 @@ def _main(argv=None):
     pc.add_argument("--cat")
     pc.add_argument("--entity-ids")
     pc.add_argument("--source-tag", default="manual")
+    pc.add_argument("--namespace", default=None,
+                    help="记忆分区（默认 default；用于隔离不同用途的记忆）")
     pc.add_argument("--list", action="store_true")
     pc.add_argument("--search")
     pc.add_argument("--get", type=int)
@@ -1528,6 +1538,8 @@ def _main(argv=None):
     pd.add_argument("--title")
     pd.add_argument("--text", default="")
     pd.add_argument("--source")
+    pd.add_argument("--namespace", default=None,
+                    help="记忆分区（默认 default；用于隔离不同用途的记忆）")
     pd.add_argument("--list", action="store_true")
     pd.add_argument("--search")
     pd.add_argument("--get", type=int)
@@ -1546,6 +1558,8 @@ def _main(argv=None):
     pf.add_argument("--type", choices=FRAGMENT_TYPES, default="fact")
     pf.add_argument("--content")
     pf.add_argument("--subject", default="work")
+    pf.add_argument("--namespace", default=None,
+                    help="记忆分区（默认 default；用于隔离不同用途的记忆）")
     pf.add_argument("--list", action="store_true")
     pf.add_argument("--search")
 
@@ -1623,7 +1637,7 @@ def _main(argv=None):
     if args.cmd == "entity":
         if args.add:
             eid = db.add_entity(args.type, args.name, org=args.org, role=args.role,
-                                if_exists=args.if_exists)
+                                if_exists=args.if_exists, namespace=getattr(args, "namespace", None))
             print("entity id =", eid)
         elif args.list:
             for r in db.list_entities(args.type):
@@ -1642,7 +1656,8 @@ def _main(argv=None):
         if args.add:
             eids = [int(x) for x in args.entity_ids.split(",")] if args.entity_ids else None
             cid = db.add_content(args.title, args.body, ctype=args.type, status=args.status,
-                                 category=args.cat, entity_ids=eids, source_tag=args.source_tag)
+                                 category=args.cat, entity_ids=eids, source_tag=args.source_tag,
+                                 namespace=getattr(args, "namespace", None))
             print("content id =", cid)
         elif args.get:
             r = db.get_content(args.get)
@@ -1658,7 +1673,8 @@ def _main(argv=None):
 
     elif args.cmd == "doc":
         if args.add:
-            did = db.add_document(args.title, args.text, source=args.source)
+            did = db.add_document(args.title, args.text, source=args.source,
+                                  namespace=getattr(args, "namespace", None))
             print("doc id =", did)
         elif args.get:
             chunks = db.get_document_chunks(args.get)
@@ -1689,7 +1705,8 @@ def _main(argv=None):
 
     elif args.cmd == "frag":
         if args.add:
-            fid = db.add_fragment(args.type, args.content, subject=args.subject)
+            fid = db.add_fragment(args.type, args.content, subject=args.subject,
+                                  namespace=getattr(args, "namespace", None))
             print("fragment id =", fid)
         elif args.list:
             for r in db.list_fragments(args.type):
