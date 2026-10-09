@@ -57,10 +57,12 @@ CREATE TABLE IF NOT EXISTS entity_link (
   relation TEXT NOT NULL,
   note TEXT,
   valid_from TEXT,     -- 关系生效时间（ISO 日期），可空=一直生效
-  valid_until TEXT,    -- 关系失效时间（ISO 日期），可空=永不过期；查询/图谱过滤已过期边
-  created_at TEXT DEFAULT (datetime('now','localtime')),
-  UNIQUE(from_id, to_id, relation)
+  valid_until TEXT,    -- 关系失效时间（ISO 日期），可空=永不过期；窗口为左闭右开 [valid_from, valid_until)
+  created_at TEXT DEFAULT (datetime('now','localtime'))
 );
+-- 同一 (from,to,relation) 允许存在多条记录，各带自己的时间窗 —— 改期/失效都只是"再多一条"，
+-- 不会覆盖或删除旧记录，所以"某段时间里我们认为这段关系成立"可以完整回溯（bitemporal）。
+-- 唯一性只约束"当前仍然有效"（valid_until 为空）的那一条，见 __init__ 里的部分唯一索引。
 
 -- 实体 ↔ 知识库文档 关联（2026-09-04：客户/项目实体挂到具体文档，如采集脚本/报告/知识库包）
 CREATE TABLE IF NOT EXISTS entity_doc (
@@ -304,14 +306,56 @@ class CyberBrain:
         self.con.row_factory = sqlite3.Row
         self.con.execute("PRAGMA foreign_keys=ON")
         self.con.executescript(SCHEMA)
-        # 迁移：老库 entity_link 补 valid_from / valid_until 列 + 索引（幂等）
+        # 迁移：老库 entity_link 补 valid_from / valid_until 列（幂等）
         try:
             cols = [r[1] for r in self.con.execute("PRAGMA table_info(entity_link)")]
             if "valid_from" not in cols:
                 self.con.execute("ALTER TABLE entity_link ADD COLUMN valid_from TEXT")
             if "valid_until" not in cols:
                 self.con.execute("ALTER TABLE entity_link ADD COLUMN valid_until TEXT")
-            self.con.execute("CREATE INDEX IF NOT EXISTS idx_entity_link_valid ON entity_link(valid_until)")
+            self.con.commit()
+        except Exception:
+            pass
+
+        # 迁移：老库 entity_link 带着 UNIQUE(from_id,to_id,relation)，同一关系只能存一行，
+        # 于是"到期即 DELETE、改期即在原文上覆盖"，一段关系曾经在什么时间段成立无法回溯。
+        # 对应外部审查（Agent Memory Atlas, 2026-09-28）：
+        #   "the validity window on entity links is overwritten in place and deleted on expiry,
+        #    so the period a relation was believed cannot be recovered."
+        # 这里原地重建该表去掉行级唯一约束（幂等：只有检测到 UNIQUE 约束时才跑）。
+        try:
+            _has_unique = any(r[3] == "u"
+                              for r in self.con.execute("PRAGMA index_list(entity_link)"))
+            if _has_unique:
+                self.con.executescript(
+                    "BEGIN;"
+                    "CREATE TABLE entity_link_rebuild ("
+                    "  id INTEGER PRIMARY KEY AUTOINCREMENT,"
+                    "  from_id INTEGER NOT NULL REFERENCES entity(id),"
+                    "  to_id INTEGER NOT NULL REFERENCES entity(id),"
+                    "  relation TEXT NOT NULL,"
+                    "  note TEXT,"
+                    "  valid_from TEXT,"
+                    "  valid_until TEXT,"
+                    "  created_at TEXT DEFAULT (datetime('now','localtime')));"
+                    "INSERT INTO entity_link_rebuild"
+                    " (id,from_id,to_id,relation,note,valid_from,valid_until,created_at)"
+                    " SELECT id,from_id,to_id,relation,note,valid_from,valid_until,created_at"
+                    " FROM entity_link;"
+                    "DROP TABLE entity_link;"
+                    "ALTER TABLE entity_link_rebuild RENAME TO entity_link;"
+                    "COMMIT;")
+        except Exception:
+            pass
+
+        # entity_link 索引：时间窗检索 + 每个三元组只允许一条"当前有效"记录
+        try:
+            self.con.executescript(
+                "CREATE INDEX IF NOT EXISTS idx_entity_link_valid ON entity_link(valid_until);"
+                "CREATE INDEX IF NOT EXISTS idx_entity_link_from ON entity_link(from_id);"
+                "CREATE INDEX IF NOT EXISTS idx_entity_link_to ON entity_link(to_id);"
+                "CREATE UNIQUE INDEX IF NOT EXISTS idx_entity_link_open"
+                " ON entity_link(from_id,to_id,relation) WHERE valid_until IS NULL;")
             self.con.commit()
         except Exception:
             pass
@@ -375,24 +419,41 @@ class CyberBrain:
         return cur.lastrowid
 
     def link(self, a, b, relation, note=None, valid_from=None, valid_until=None):
-        """建立实体关系。支持时间有效性：valid_until 过期后该关系不再出现在图谱/邻居。
+        """建立实体关系，并**保留历史**（bitemporal）。
 
-        若已存在同 (from,to,relation) 关系，则更新其时间窗口与备注（而非忽略）。
+        每次调用都新增一条记录，不覆盖、不删除已有记录 —— 因此
+        「某段时间里我们认为这段关系成立」可以完整回溯，见 `neighbors(as_of=...)`。
+
+        时间窗为左闭右开区间 `[valid_from, valid_until)`：
+
+        1. `valid_from` 缺省为今天。
+        2. 调用方显式给了 `valid_until` → 照写。这只是一条有界的历史记录，
+           **不会去动当前有效的那条**（旧实现会在这里 DELETE 掉旧关系，历史就没了）。
+        3. 未给 `valid_until` 时，看是否已存在同 (from,to,relation) 的开放区间
+           （`valid_until` 为空 = 当前有效）：
+           - 新记录起点不早于旧起点 → 旧记录在新起点处**关闭**（"从这天起改口"），新记录接管；
+           - 新记录起点早于旧起点 → 新记录作为历史区间插在旧记录之前，
+             其 `valid_until` 缺省取旧记录起点，旧记录保持开放。
         """
-        if valid_until:
-            # 已过期的时间窗口：直接删除旧关系（避免残留死边）
-            if valid_until < __import__("datetime").date.today().isoformat():
-                self.con.execute("DELETE FROM entity_link WHERE from_id=? AND to_id=? AND relation=?",
-                                 (a, b, relation))
-                self.con.commit()
-                return
-        self.con.execute(
+        import datetime as _dt
+        vf = valid_from or _dt.date.today().isoformat()
+        vu = valid_until
+        old = self.con.execute(
+            "SELECT id, valid_from FROM entity_link "
+            "WHERE from_id=? AND to_id=? AND relation=? AND valid_until IS NULL "
+            "ORDER BY id LIMIT 1", (a, b, relation)).fetchone()
+        if old and valid_until is None:
+            old_vf = old["valid_from"] or vf
+            if vf >= old_vf:
+                self.con.execute("UPDATE entity_link SET valid_until=? WHERE id=?", (vf, old["id"]))
+            else:
+                vu = old_vf
+        cur = self.con.execute(
             "INSERT INTO entity_link(from_id,to_id,relation,note,valid_from,valid_until) "
-            "VALUES(?,?,?,?,?,?) "
-            "ON CONFLICT(from_id,to_id,relation) DO UPDATE SET "
-            "note=excluded.note, valid_from=excluded.valid_from, valid_until=excluded.valid_until",
-            (a, b, relation, note, valid_from, valid_until))
+            "VALUES(?,?,?,?,?,?)",
+            (a, b, relation, note, vf, vu))
         self.con.commit()
+        return cur.lastrowid
 
     def get_entity(self, eid):
         return self.con.execute("SELECT * FROM entity WHERE id=?", (eid,)).fetchone()
@@ -419,21 +480,31 @@ class CyberBrain:
             "SELECT * FROM entity WHERE name LIKE ? OR org LIKE ? ORDER BY updated_at DESC LIMIT ?",
             (like, like, limit)).fetchall()
 
-    def neighbors(self, eid):
-        """返回实体的邻居（仅未过期的关系）。"""
+    def neighbors(self, eid, as_of=None):
+        """返回实体的邻居关系。
+
+        - 不传 `as_of`：只返回**当前有效**的关系（生效日已到、失效日未到）。
+        - 传 `as_of`（ISO 日期）：返回**那一天成立**的关系 —— 已经失效的历史关系同样会返回，
+          这正是保留时间窗的意义（bitemporal 时间点查询：回答"当时我们以为是什么样"）。
+
+        时间窗按左闭右开 `[valid_from, valid_until)` 判断；两列可空，分别表示"一直有效"/"永不过期"。
+        """
+        import datetime as _dt
+        day = as_of or _dt.date.today().isoformat()
+        where = ("(l.valid_from IS NULL OR l.valid_from<=?) "
+                 "AND (l.valid_until IS NULL OR l.valid_until>?)")
         out = []
-        today = __import__("datetime").date.today().isoformat()
         for r in self.con.execute(
                 "SELECT l.to_id AS other, l.relation, e.name AS other_name, e.type AS other_type, "
                 "l.valid_from, l.valid_until "
                 "FROM entity_link l JOIN entity e ON e.id=l.to_id "
-                "WHERE l.from_id=? AND (l.valid_until IS NULL OR l.valid_until>=?)", (eid, today)):
+                "WHERE l.from_id=? AND " + where, (eid, day, day)):
             out.append(dict(r))
         for r in self.con.execute(
                 "SELECT l.from_id AS other, l.relation, e.name AS other_name, e.type AS other_type, "
                 "l.valid_from, l.valid_until "
                 "FROM entity_link l JOIN entity e ON e.id=l.from_id "
-                "WHERE l.to_id=? AND (l.valid_until IS NULL OR l.valid_until>=?)", (eid, today)):
+                "WHERE l.to_id=? AND " + where, (eid, day, day)):
             out.append(dict(r))
         return out
 
@@ -1517,6 +1588,15 @@ def _main(argv=None):
     pl.add_argument("--to", dest="to_id", type=int, required=True)
     pl.add_argument("--relation", required=True)
     pl.add_argument("--note")
+    pl.add_argument("--valid-from", dest="valid_from", default=None,
+                    help="关系生效日期（ISO，缺省=今天）")
+    pl.add_argument("--valid-until", dest="valid_until", default=None,
+                    help="关系失效日期（ISO，缺省=永不过期；窗口为 [生效, 失效)）")
+
+    pn = sub.add_parser("neighbors", help="实体邻居（--as-of 可查历史某天成立的关系）")
+    pn.add_argument("--id", type=int, required=True, help="实体 ID")
+    pn.add_argument("--as-of", dest="as_of", default=None,
+                    help="查这一天成立的关系（ISO 日期）；不传则只看当前有效")
 
     pc = sub.add_parser("content", help="内容")
     pc.add_argument("--add", action="store_true")
@@ -1649,8 +1729,18 @@ def _main(argv=None):
             print("entity: 需要 --add / --list / --search")
 
     elif args.cmd == "link":
-        db.link(args.from_id, args.to_id, args.relation, args.note)
+        db.link(args.from_id, args.to_id, args.relation, args.note,
+                valid_from=args.valid_from, valid_until=args.valid_until)
         print("linked")
+
+    elif args.cmd == "neighbors":
+        rows = db.neighbors(args.id, as_of=args.as_of)
+        if not rows:
+            print("（无）")
+        for r in rows:
+            win = "[%s ~ %s)" % (r["valid_from"] or "…", r["valid_until"] or "…")
+            print(r["other"], r["relation"], r["other_name"],
+                  "[%s]" % (r["other_type"] or ""), win)
 
     elif args.cmd == "content":
         if args.add:

@@ -204,6 +204,95 @@ finally:
 
 # ─────────────────────────────────────────────────────────────
 print()
+print("【7】entity_link 时间窗：保留历史（对应 bitemporal）")
+print("-" * 74)
+db_path = fresh_db()
+db = CyberBrain(db_path)
+try:
+    a = db.add_entity("org", "测试甲方")
+    b = db.add_entity("org", "测试乙方")
+    d1, d2 = "2026-01-01", "2026-06-01"
+
+    # ① 先建立一段关系，再改口 —— 旧实现会原地 UPSERT，只剩一条
+    db.link(a, b, "serves", note="第一版", valid_from=d1)
+    db.link(a, b, "serves", note="改口版", valid_from=d2)
+    rel_rows = db.con.execute(
+        "SELECT * FROM entity_link WHERE from_id=? AND to_id=? AND relation=? ORDER BY id",
+        (a, b, "serves")).fetchall()
+    check("★ 改期不再覆盖：同一关系留下 2 条记录（本项验收核心）",
+          len(rel_rows) == 2, "实际 %d 条" % len(rel_rows))
+    check("旧记录被关闭在新记录的起点上，而不是被删掉",
+          len(rel_rows) == 2 and rel_rows[0]["valid_until"] == d2,
+          "第一条 valid_until=%s" % (rel_rows[0]["valid_until"] if rel_rows else "无"))
+    check("同一关系「当前有效」的只有一条（部分唯一索引生效）",
+          len([r for r in rel_rows if r["valid_until"] is None]) == 1,
+          "开放区间 %d 条" % len([r for r in rel_rows if r["valid_until"] is None]))
+
+    # ② 已失效的时间窗：旧实现会 DELETE，现在必须留下来
+    db.link(a, b, "served_by", note="早就结束的关系",
+            valid_from="2024-01-01", valid_until="2024-03-01")
+    left = db.con.execute(
+        "SELECT COUNT(*) FROM entity_link WHERE relation='served_by'").fetchone()[0]
+    check("★ 传入已过去的 valid_until 不再删除记录（旧实现会 DELETE）",
+          left == 1, "实际剩余 %d 条" % left)
+
+    # ③ 时间点查询：同一条关系，在不同日期问，答案不同
+    mid = {r["relation"] for r in db.neighbors(a, as_of="2026-03-01")}
+    past = {r["relation"] for r in db.neighbors(a, as_of="2024-02-01")}
+    now = {r["relation"] for r in db.neighbors(a)}
+    check("★ 时间点查询 as_of=2026-03：成立的是 serves，served_by 不在其中",
+          "serves" in mid and "served_by" not in mid, "实际=%s" % sorted(mid))
+    check("★ 时间点查询 as_of=2024-02：成立的是 served_by（如今早已失效）",
+          "served_by" in past and "serves" not in past, "实际=%s" % sorted(past))
+    check("不带 as_of 时只返回当前有效的关系（失效的历史不出现）",
+          now == {"serves"}, "实际=%s" % sorted(now))
+finally:
+    try:
+        db.con.close()
+        os.unlink(db_path)
+    except OSError:
+        pass
+
+# ④ 老库迁移：带着 UNIQUE 约束的旧表必须被无损重建，否则历史存不下第二条
+legacy = fresh_db()
+_lc = sqlite3.connect(legacy)
+_lc.executescript(
+    "CREATE TABLE entity (id INTEGER PRIMARY KEY AUTOINCREMENT, type TEXT NOT NULL,"
+    " name TEXT NOT NULL, org TEXT, role TEXT, contact_json TEXT DEFAULT '{}',"
+    " tags_json TEXT DEFAULT '[]', meta_json TEXT DEFAULT '{}',"
+    " source_tag TEXT NOT NULL DEFAULT 'manual', authorization_ref TEXT DEFAULT 'manual',"
+    " created_at TEXT DEFAULT (datetime('now','localtime')),"
+    " updated_at TEXT DEFAULT (datetime('now','localtime')));"
+    "CREATE TABLE entity_link (id INTEGER PRIMARY KEY AUTOINCREMENT,"
+    " from_id INTEGER NOT NULL, to_id INTEGER NOT NULL, relation TEXT NOT NULL, note TEXT,"
+    " valid_from TEXT, valid_until TEXT,"
+    " created_at TEXT DEFAULT (datetime('now','localtime')),"
+    " UNIQUE(from_id, to_id, relation));"
+    "INSERT INTO entity(type,name) VALUES('org','老库甲方');"
+    "INSERT INTO entity(type,name) VALUES('org','老库乙方');"
+    "INSERT INTO entity_link(from_id,to_id,relation,valid_from)"
+    " VALUES(1,2,'serves','2025-01-01');")
+_lc.commit()
+_lc.close()
+_ldb = CyberBrain(legacy)
+try:
+    kept = _ldb.con.execute("SELECT COUNT(*) FROM entity_link").fetchone()[0]
+    still_unique = any(r[3] == "u" for r in _ldb.con.execute("PRAGMA index_list(entity_link)"))
+    check("老库迁移：原有关系数据无损保留", kept == 1, "实际 %d 条" % kept)
+    check("★ 老库迁移：UNIQUE 约束已被摘除（否则第二条历史写不进去）", not still_unique)
+    _ldb.link(1, 2, "serves", note="迁移后改口", valid_from="2026-01-01")
+    after = _ldb.con.execute(
+        "SELECT COUNT(*) FROM entity_link WHERE relation='serves'").fetchone()[0]
+    check("迁移后同一关系能存下第 2 条记录", after == 2, "实际 %d 条" % after)
+finally:
+    try:
+        _ldb.con.close()
+        os.unlink(legacy)
+    except OSError:
+        pass
+
+# ─────────────────────────────────────────────────────────────
+print()
 print("=" * 74)
 print("结果：通过 %d ｜ 失败 %d" % (len(PASS), len(FAIL)))
 print("=" * 74)
