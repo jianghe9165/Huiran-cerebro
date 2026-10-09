@@ -5,6 +5,70 @@
 
 ---
 
+## [1.7.0] — 2026-10-09
+
+> **机制补全版本**。回应 Agent Memory Atlas（2026-09-28 审查）中指出的未实现机制。
+> 其中两项由 **@jianghe9165** 贡献 —— 这也是本仓库接收的**首个外部 PR**。
+> 按语义化规则记为 **minor**（新增能力，向后兼容）。
+
+背景：1.6.0 修掉了「机制声明了但没接线」的一批问题，但那次只覆盖了 7 项 rubric
+机制中的 3 项。本版补上其中两项，外加一处遗漏的读取路径。
+
+### 新增：`namespace` 写入路径（[#1](https://github.com/qilunuojiang9-hue/Huiran-cerebro/pull/1)，@jianghe9165）
+
+审查原文：
+
+> "`scope_enforced` is withheld because **nothing writes a namespace** other than `default`."
+
+即：`namespace` 列已存在、检索侧也已支持按它过滤，但**没有任何写入路径会写入
+`default` 以外的值** —— 隔离的「读」有了，「写」没有。
+
+- `add_fragment` / `add_entity` / `add_content` / `add_document` 四个写入函数补上
+  `namespace` 参数（末尾参数，默认 `None`，落库取值 `namespace or "default"`）；
+- CLI 的 `frag` / `entity` / `content` / `doc` 四个子命令各增加 `--namespace`；
+- `add_entity` 的判重（`if_exists="skip"`）同步按 namespace 隔离，
+  否则跨分区的同名实体会被误判为重复而跳过。
+
+**设计决策（选项 A）**：不传 namespace 时，写入落 `default`、检索返回全部。
+这是保持既有语义（`search_memory` 原本即为 `not namespace or r["namespace"] == namespace`），
+避免把「不带 namespace 的检索忽然看不到老数据」变成破坏性变更。
+
+### 新增：`entity_link` 保留关系历史（[#2](https://github.com/qilunuojiang9-hue/Huiran-cerebro/pull/2)，@jianghe9165）
+
+审查原文：
+
+> "`bitemporal` is withheld because the validity window on entity links is
+> **overwritten in place** and **deleted on expiry**, so the period a relation was
+> believed **cannot be recovered**."
+
+- 去掉 `entity_link` 的行级 `UNIQUE(from_id, to_id, relation)`，改为**部分唯一索引**
+  只约束「当前有效」的那一条：
+  `CREATE UNIQUE INDEX idx_entity_link_open ON entity_link(from_id,to_id,relation) WHERE valid_until IS NULL`；
+- `link()` 每次调用**新增一条记录**，不再覆盖、不再删除：显式给 `valid_until` 只插一条
+  有界历史；新起点不早于旧起点时旧记录在新起点处关闭（"从这天起改口"）；
+- `neighbors(eid, as_of=...)` 新增**时间点查询** —— 传 `as_of` 可查「那一天成立的关系」，
+  已失效的历史关系同样返回。时间窗统一按左闭右开 `[valid_from, valid_until)` 判断；
+- CLI 新增 `neighbors` 子命令（含 `--as-of`），`link` 新增 `--valid-from` / `--valid-until`；
+- **老库启动时幂等重建该表**（检测到行级 UNIQUE 才执行，先建新表 → 拷数据 → 改名），
+  数据无损保留。
+
+**行为变化（已在 CHANGELOG 与测试中写明）**：默认视图现在同时尊重 `valid_from`，
+失效日按 `>` 而非 `>=` 判断 —— 即「尚未生效」与「失效当天」的关系不再出现在默认视图里。
+统一口径是为了让 `as_of` 时间点查询有一致的判断标准。
+
+### 修复
+
+- **`frag --search` 未透传 `namespace`**：`--namespace` 在 `--add` 分支已生效，
+  但 `--search` 分支没往下传，导致带 `--namespace` 检索时静默返回全部分区 ——
+  参数声明了却不生效。已补上透传。这类「声明了但没接线」正是 1.6.0 修过的那类问题。
+
+### 测试
+
+`tools/test_cyber_brain.py` 由 19 条扩至 **35 条**（新增 namespace 写入路径 6 条、
+`entity_link` 时间窗 10 条），全部通过。
+
+---
+
 ## [1.6.1] — 2026-10-05
 
 > 文档与项目可见性版本。**不改动任何运行逻辑**，因此按语义化规则记为 patch。
