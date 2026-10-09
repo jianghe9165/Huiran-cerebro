@@ -25,7 +25,7 @@ import datetime
 __all__ = ["CyberBrain", "ENTITY_TYPES", "CONTENT_TYPES", "FRAGMENT_TYPES"]
 
 # 版本号单一事实源：改这里，然后跑 tools/check_version.py 同步 README 徽章
-__version__ = "1.6.1"
+__version__ = "1.7.0"
 
 ENTITY_TYPES = ["person", "org", "project", "account", "platform", "product", "tool", "other"]
 CONTENT_TYPES = ["note", "article", "task", "decision", "meeting", "idea", "issue", "report"]
@@ -1802,7 +1802,10 @@ def _main(argv=None):
             for r in db.list_fragments(args.type):
                 print(r["id"], f"[{r['fragment_type']}]", r["content"][:80])
         elif args.search:
-            for r in db.search_memory(args.search, audit=False):
+            # 2026-10-09 修：此前这里没有透传 namespace，导致 --namespace 在检索侧形同虚设
+            # （声明了参数却不生效，正是本项目被外部审查批评过的"写了但没接线"那类问题）
+            for r in db.search_memory(args.search, audit=False,
+                                      namespace=getattr(args, "namespace", None)):
                 print(r["id"], f"[{r['fragment_type']}]", r["content"][:80])
         else:
             print("frag: 需要 --add / --list / --search")
@@ -1818,7 +1821,7 @@ def _main(argv=None):
             yesterday = (_dt.date.today() - _dt.timedelta(days=1)).isoformat()
             cnt = db.con.execute(
                 "SELECT COUNT(*) FROM memory_fragments WHERE fragment_type='event' "
-                "AND created_at LIKE ?", (yesterday + "%",)).fetchone()[0]
+                "AND status='active' AND created_at LIKE ?", (yesterday + "%",)).fetchone()[0]
             if cnt > 0:
                 print(f"✅ 昨天（{yesterday}）已记录 {cnt} 条事件")
             else:
