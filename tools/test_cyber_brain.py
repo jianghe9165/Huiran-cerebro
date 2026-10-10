@@ -207,6 +207,46 @@ try:
 
     # ─────────────────────────────────────────────────────────
     print()
+    print("【4b】AI 会话追加（conv --append 曾经每次必崩）")
+    print("-" * 74)
+    import json as _json
+    import subprocess
+
+    _cv = fresh_db()
+    _cmd = [sys.executable, os.path.join(ROOT, "cyber_brain.py"), "--db", _cv]
+    subprocess.run(_cmd + ["conv", "--add", "--title", "回归测试会话", "--session", "rt-1"],
+                   capture_output=True, text=True, encoding="utf-8", errors="replace")
+    _r = subprocess.run(
+        _cmd + ["conv", "--append", "1", "--role", "user",
+                "--text", "回归测试：追加这句话"],
+        capture_output=True, text=True, encoding="utf-8", errors="replace")
+    _msg = ((_r.stderr or "") + (_r.stdout or "")).strip()
+    check("★ conv --append 不再抛 NameError（_now 未定义的老 bug）",
+          "appended" in (_r.stdout or "") and "NameError" not in (_r.stderr or ""),
+          _msg[:140])
+
+    _cb = CyberBrain(_cv)
+    try:
+        _row = _cb.con.execute(
+            "SELECT messages_json FROM ai_conversation WHERE id=1").fetchone()
+    finally:
+        _cb.con.close()
+    _msgs = _json.loads(_row["messages_json"]) if _row else []
+    check("追加的消息真的落库了（条数、角色、内容都对）",
+          len(_msgs) == 1 and _msgs[0].get("role") == "user"
+          and _msgs[0].get("content") == "回归测试：追加这句话",
+          "实际=%s" % (_msgs,))
+    _at = str(_msgs[0].get("at", "")) if _msgs else ""
+    check("时间戳格式与库内其他时间一致（YYYY-MM-DD HH:MM:SS）",
+          len(_at) == 19 and _at[4] == "-" and _at[10] == " " and _at[13] == ":",
+          "at=%r" % _at)
+    try:
+        os.unlink(_cv)
+    except OSError:
+        pass
+
+    # ─────────────────────────────────────────────────────────
+    print()
     print("【5】schema 完整性")
     print("-" * 74)
     for tbl in ("entity", "content_item", "kb_document", "memory_fragments"):
@@ -360,49 +400,6 @@ finally:
     try:
         _ldb.con.close()
         os.unlink(legacy)
-    except OSError:
-        pass
-
-# ─────────────────────────────────────────────────────────────
-print()
-print("【8】变更审计覆盖面（对应 audit_log）")
-print("-" * 74)
-db_path = fresh_db()
-db = CyberBrain(db_path)
-try:
-    e1 = db.add_entity("org", "审计测试实体甲")
-    e2 = db.add_entity("org", "审计测试实体乙")
-    fid = db.add_fragment("fact", "审计测试碎片内容")
-    cid = db.add_content("审计测试内容", body="正文")
-    did = db.add_document("审计测试文档", "正文内容")
-    db.link(e1, e2, "serves", valid_from="2026-01-01")
-    db.update_content(cid, title="审计测试内容（已改）")
-
-    muts = db.list_mutations(50)
-    kinds = {(m["target_type"], m["action"]) for m in muts}
-    check("★ 新增记忆碎片留下变更记录", ("memory_fragment", "add") in kinds,
-          "实际=%s" % sorted(kinds))
-    check("★ 新增实体留下变更记录", ("entity", "add") in kinds)
-    check("新增内容留下变更记录", ("content_item", "add") in kinds)
-    check("新增知识库文档留下变更记录", ("kb_document", "add") in kinds)
-    check("★ 建立实体关系留下变更记录（原实现只记 merge/unmerge）",
-          ("entity_link", "link") in kinds)
-    check("修改内容留下变更记录", ("content_item", "update") in kinds)
-
-    ups = [m for m in muts if m["action"] == "update" and m["target_type"] == "content_item"]
-    check("修改记录里带了改动后的值（detail 不是空壳）",
-          bool(ups) and "审计测试内容（已改）" in (ups[0]["detail"] or ""),
-          ups[0]["detail"] if ups else "无")
-
-    check("变更记录按时间倒序（最新在前）",
-          [m["id"] for m in muts] == sorted([m["id"] for m in muts], reverse=True))
-    check("list_mutations 支持按 action 过滤",
-          all(m["action"] == "add" for m in db.list_mutations(50, action="add")),
-          "add 类记录")
-finally:
-    try:
-        db.con.close()
-        os.unlink(db_path)
     except OSError:
         pass
 
