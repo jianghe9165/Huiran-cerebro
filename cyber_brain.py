@@ -1821,7 +1821,7 @@ def _main(argv=None):
             yesterday = (_dt.date.today() - _dt.timedelta(days=1)).isoformat()
             cnt = db.con.execute(
                 "SELECT COUNT(*) FROM memory_fragments WHERE fragment_type='event' "
-                "AND created_at LIKE ?", (yesterday + "%",)).fetchone()[0]
+                "AND status='active' AND created_at LIKE ?", (yesterday + "%",)).fetchone()[0]
             if cnt > 0:
                 print(f"✅ 昨天（{yesterday}）已记录 {cnt} 条事件")
             else:

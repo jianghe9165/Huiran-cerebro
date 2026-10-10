@@ -102,6 +102,78 @@ try:
 
     # ─────────────────────────────────────────────────────────
     print()
+    print("【2b】status 谓词覆盖：所有 event 查询都不得漏掉 status")
+    print("-" * 74)
+
+    import datetime as _dt
+    import re as _re
+    import subprocess
+    import session_log as _sl
+
+    # ① 命令行：event --check（昨天有没有漏记）不得把 merged 的算进去
+    _chk = fresh_db()
+    _cb = CyberBrain(_chk)
+    _y = (_dt.date.today() - _dt.timedelta(days=1)).isoformat()
+    _e1 = _cb.add_fragment("event", "昨天的事件（仍然有效）", subject="work_event")
+    _e2 = _cb.add_fragment("event", "昨天的事件（已被合并）", subject="work_event")
+    _cb.con.execute("UPDATE memory_fragments SET status='merged' WHERE id=?", (_e2,))
+    _cb.con.execute("UPDATE memory_fragments SET created_at=? WHERE id IN (?,?)",
+                    (_y + " 10:00:00", _e1, _e2))
+    _cb.con.commit()
+    _cb.con.close()
+    _r = subprocess.run(
+        [sys.executable, os.path.join(ROOT, "cyber_brain.py"),
+         "--db", _chk, "event", "--check"],
+        capture_output=True, text=True, encoding="utf-8", errors="replace")
+    _out = (_r.stdout or "") + (_r.stderr or "")
+    check("★ event --check 只数 active 的 event（已合并的不算）",
+          "已记录 1 条事件" in _out, _out.strip()[:120])
+    try:
+        os.unlink(_chk)
+    except OSError:
+        pass
+
+    # ② 行为：session_log 的三个读取入口都只看 active
+    _sl_db = fresh_db()
+    _slb = CyberBrain(_sl_db)
+    try:
+        _s1 = _slb.add_fragment("event", "打卡：完成检索改造", subject="work_event")
+        _s2 = _slb.add_fragment("event", "打卡：这条已经合并掉了", subject="work_event")
+        _slb.con.execute("UPDATE memory_fragments SET status='merged' WHERE id=?", (_s2,))
+        _slb.con.commit()
+        _ids = {r["id"] for r in _sl.today(db_path=_sl_db)} | \
+               {r["id"] for r in _sl.recent(50, db_path=_sl_db)}
+        check("★ session_log.today() / recent() 不再列出已合并的 event",
+              _s2 not in _ids and _s1 in _ids,
+              "命中 id=%s（含已合并的 %s）" % (sorted(_ids), _s2))
+        check("★ session_log 判重不再把已合并的碎片当成重复",
+              _sl.is_dup(_slb, "打卡：这条已经合并掉了",
+                         _dt.date.today().isoformat()) is False,
+              "is_dup 仍把已合并碎片判为重复")
+    finally:
+        try:
+            _slb.con.close()
+            os.unlink(_sl_db)
+        except OSError:
+            pass
+
+    # ③ 源码级不变量：event 碎片查询一律要带 status 谓词
+    #    （daily_brief / web_ui 是脚本与 Flask 入口，不适合直接 import 断言，改用不变量守住）
+    _bad = []
+    for _f in ("cyber_brain.py", "web_ui.py", "session_log.py", "daily_brief.py"):
+        try:
+            with open(os.path.join(ROOT, _f), encoding="utf-8") as _fh:
+                _src = _fh.read()
+        except OSError:
+            continue
+        for _m in _re.finditer(r"fragment_type='event'", _src):
+            if "status='active'" not in _src[_m.end():_m.end() + 120]:
+                _bad.append("%s:%d" % (_f, _src[:_m.start()].count("\n") + 1))
+    check("★ 所有 event 查询都带 status='active'（源码级回归护栏）",
+          not _bad, "遗漏位置: %s" % ", ".join(_bad))
+
+    # ─────────────────────────────────────────────────────────
+    print()
     print("【3】撤销合并（回应 Open Question：merged 能否恢复）")
     print("-" * 74)
     n = db.unmerge_fragment(id2)
