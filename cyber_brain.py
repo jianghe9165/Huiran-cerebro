@@ -416,6 +416,8 @@ class CyberBrain:
             " VALUES(?,?,?,?,?,?,?,?,?,?)",
             (etype, name, org, role, _jl(contact), _jl(tags), _jl(meta), source_tag, authorization_ref, ns))
         self.con.commit()
+        self._log_mutation("add", "entity", cur.lastrowid,
+                           {"name": name, "type": etype, "namespace": ns})
         return cur.lastrowid
 
     def link(self, a, b, relation, note=None, valid_from=None, valid_until=None):
@@ -453,6 +455,9 @@ class CyberBrain:
             "VALUES(?,?,?,?,?,?)",
             (a, b, relation, note, vf, vu))
         self.con.commit()
+        self._log_mutation("link", "entity_link", cur.lastrowid,
+                           {"from": a, "to": b, "relation": relation,
+                            "valid_from": vf, "valid_until": vu})
         return cur.lastrowid
 
     def get_entity(self, eid):
@@ -523,6 +528,8 @@ class CyberBrain:
              _jl(tags), _jl(entity_ids), source_type, source_tag, authorization_ref,
              parent_id, _jl(keyword_refs), namespace or "default"))
         self.con.commit()
+        self._log_mutation("add", "content_item", cur.lastrowid,
+                           {"title": title, "type": ctype, "namespace": namespace or "default"})
         return cur.lastrowid
 
     def get_content(self, cid):
@@ -531,6 +538,7 @@ class CyberBrain:
     def update_content(self, cid, **kw):
         if not kw:
             return
+        before = self.get_content(cid)
         sets = []
         params = []
         for k, v in kw.items():
@@ -547,6 +555,17 @@ class CyberBrain:
         params.append(cid)
         self.con.execute(f"UPDATE content_item SET {', '.join(sets)} WHERE id=?", params)
         self.con.commit()
+        # 变更审计：记下改了哪些字段、改动前后的值（detail 形如 {"changed": {...}}）
+        if before is not None:
+            changed = {}
+            for k, v in kw.items():
+                col = k + "_json" if k in ("tags", "entity_ids", "keyword_refs") else k
+                new = _jl(v) if col.endswith("_json") else v
+                old = before[col] if col in before.keys() else None
+                if old != new:
+                    changed[k] = {"before": old, "after": new}
+            if changed:
+                self._log_mutation("update", "content_item", cid, {"changed": changed})
 
     def list_content(self, ctype=None, status=None, limit=50):
         sql = "SELECT * FROM content_item WHERE 1=1"
@@ -623,6 +642,8 @@ class CyberBrain:
             start += step
             seq += 1
         self.con.commit()
+        self._log_mutation("add", "kb_document", doc_id,
+                           {"title": title, "chunks": seq, "namespace": namespace or "default"})
         return doc_id
 
     def list_documents(self, limit=50):
@@ -740,6 +761,9 @@ class CyberBrain:
             (ftype, subject, content, _jl(entities), _jl(tags), source_ref, importance,
              namespace or "default"))
         self.con.commit()
+        self._log_mutation("add", "memory_fragment", cur.lastrowid,
+                           {"type": ftype, "subject": subject, "importance": importance,
+                            "namespace": namespace or "default"})
         return cur.lastrowid
 
     def list_fragments(self, ftype=None, status="active", limit=50):
@@ -1047,8 +1071,12 @@ class CyberBrain:
         except Exception:
             pass
 
-    def list_mutations(self, limit=20):
-        """最近的变更记录（谁改了什么）。"""
+    def list_mutations(self, limit=20, action=None):
+        """最近的变更记录（谁改了什么）。给定 action 时只看该类动作。"""
+        if action:
+            return self.con.execute(
+                "SELECT * FROM memory_mutations WHERE action=? ORDER BY id DESC LIMIT ?",
+                (action, limit)).fetchall()
         return self.con.execute(
             "SELECT * FROM memory_mutations ORDER BY id DESC LIMIT ?", (limit,)).fetchall()
 
@@ -1598,6 +1626,11 @@ def _main(argv=None):
     pn.add_argument("--as-of", dest="as_of", default=None,
                     help="查这一天成立的关系（ISO 日期）；不传则只看当前有效")
 
+    pmu = sub.add_parser("mutations", help="变更审计：最近谁改了什么")
+    pmu.add_argument("--limit", type=int, default=20)
+    pmu.add_argument("--action", default=None,
+                     help="只看某类动作，如 add / update / link / merge / unmerge")
+
     pc = sub.add_parser("content", help="内容")
     pc.add_argument("--add", action="store_true")
     pc.add_argument("--title")
@@ -1741,6 +1774,15 @@ def _main(argv=None):
             win = "[%s ~ %s)" % (r["valid_from"] or "…", r["valid_until"] or "…")
             print(r["other"], r["relation"], r["other_name"],
                   "[%s]" % (r["other_type"] or ""), win)
+
+    elif args.cmd == "mutations":
+        rows = db.list_mutations(args.limit, action=args.action)
+        if not rows:
+            print("（无）")
+        for r in rows:
+            print(r["id"], r["created_at"], r["action"],
+                  "%s#%s" % (r["target_type"], r["target_id"] if r["target_id"] is not None else "-"),
+                  (r["detail"] or "")[:100])
 
     elif args.cmd == "content":
         if args.add:
