@@ -365,6 +365,49 @@ finally:
 
 # ─────────────────────────────────────────────────────────────
 print()
+print("【8】变更审计覆盖面（对应 audit_log）")
+print("-" * 74)
+db_path = fresh_db()
+db = CyberBrain(db_path)
+try:
+    e1 = db.add_entity("org", "审计测试实体甲")
+    e2 = db.add_entity("org", "审计测试实体乙")
+    fid = db.add_fragment("fact", "审计测试碎片内容")
+    cid = db.add_content("审计测试内容", body="正文")
+    did = db.add_document("审计测试文档", "正文内容")
+    db.link(e1, e2, "serves", valid_from="2026-01-01")
+    db.update_content(cid, title="审计测试内容（已改）")
+
+    muts = db.list_mutations(50)
+    kinds = {(m["target_type"], m["action"]) for m in muts}
+    check("★ 新增记忆碎片留下变更记录", ("memory_fragment", "add") in kinds,
+          "实际=%s" % sorted(kinds))
+    check("★ 新增实体留下变更记录", ("entity", "add") in kinds)
+    check("新增内容留下变更记录", ("content_item", "add") in kinds)
+    check("新增知识库文档留下变更记录", ("kb_document", "add") in kinds)
+    check("★ 建立实体关系留下变更记录（原实现只记 merge/unmerge）",
+          ("entity_link", "link") in kinds)
+    check("修改内容留下变更记录", ("content_item", "update") in kinds)
+
+    ups = [m for m in muts if m["action"] == "update" and m["target_type"] == "content_item"]
+    check("修改记录里带了改动后的值（detail 不是空壳）",
+          bool(ups) and "审计测试内容（已改）" in (ups[0]["detail"] or ""),
+          ups[0]["detail"] if ups else "无")
+
+    check("变更记录按时间倒序（最新在前）",
+          [m["id"] for m in muts] == sorted([m["id"] for m in muts], reverse=True))
+    check("list_mutations 支持按 action 过滤",
+          all(m["action"] == "add" for m in db.list_mutations(50, action="add")),
+          "add 类记录")
+finally:
+    try:
+        db.con.close()
+        os.unlink(db_path)
+    except OSError:
+        pass
+
+# ─────────────────────────────────────────────────────────────
+print()
 print("=" * 74)
 print("结果：通过 %d ｜ 失败 %d" % (len(PASS), len(FAIL)))
 print("=" * 74)
