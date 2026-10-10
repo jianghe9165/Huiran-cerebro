@@ -25,7 +25,7 @@ import datetime
 __all__ = ["CyberBrain", "ENTITY_TYPES", "CONTENT_TYPES", "FRAGMENT_TYPES"]
 
 # 版本号单一事实源：改这里，然后跑 tools/check_version.py 同步 README 徽章
-__version__ = "1.7.0"
+__version__ = "1.7.1"
 
 ENTITY_TYPES = ["person", "org", "project", "account", "platform", "product", "tool", "other"]
 CONTENT_TYPES = ["note", "article", "task", "decision", "meeting", "idea", "issue", "report"]

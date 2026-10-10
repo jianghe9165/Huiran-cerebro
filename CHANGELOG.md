@@ -5,6 +5,44 @@
 
 ---
 
+## [1.7.1] — 2026-10-10
+
+> **谓词补全修复**。由 **@jianghe9165** 贡献（[#9](https://github.com/qilunuojiang9-hue/Huiran-cerebro/pull/9)）。
+> 按语义化规则记为 **patch**（修 bug，不改接口）。
+
+### 修复：`status='active'` 谓词补齐到剩余 6 处 event 查询
+
+1.6.0 修过「已合并（`merged`）的碎片照样被搜出来 / 照样进开工上下文」这一类问题，
+但**只改了 `search_memory` 与 `daily_context`**，所有查 `event` 碎片的地方都漏了。
+于是被合并掉的历史事件仍然会被算进统计与列表。
+
+已补齐的 6 处：
+
+| 位置 | 影响 |
+|---|---|
+| `cyber_brain.py` — `event --check` | 昨天有没有漏记的计数 |
+| `daily_brief.py` — 今日开工简报 | 「昨天漏记提醒」的计数 |
+| `session_log.py` — `is_dup()` | **影响最实际**：此前会把已合并的碎片当成「今天记过」，导致新打卡被误判为重复而**静默跳过** |
+| `session_log.py` — `today()` | 今日打卡列表 |
+| `session_log.py` — `recent()` | 最近 N 条打卡 |
+| `web_ui.py` — `/api/daily` | 今日看板的 event 列表 |
+
+对照组：`summarize.py` 里同一类查询本来就写着 `status='active'`，
+说明这是**漏改**而不是有意设计。
+
+### 测试
+
+`tools/test_cyber_brain.py` 由 35 条增至 **39 条**，新增【2b】段落覆盖三个层次：
+
+- **命令行层** —— 真实起子进程断言 `event --check` 只数 active 的 event
+- **函数层** —— `session_log` 的三个读取入口都只看 active
+- **不变量层** —— **源码级回归护栏**：扫描四个文件，确保所有
+  `fragment_type='event'` 的查询都带 `status='active'`（防未来回归）
+
+> 该护栏经过**负对照验证**：故意移除一处谓词后，它会报出具体文件与行号并以退出码 1 失败。
+
+---
+
 ## [1.7.0] — 2026-10-09
 
 > **机制补全版本**。回应 Agent Memory Atlas（2026-09-28 审查）中指出的未实现机制。
